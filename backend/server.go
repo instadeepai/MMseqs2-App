@@ -13,7 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
+	"context"
+	"google.golang.org/api/idtoken"
 	"github.com/CAFxX/httpcompression"
 	"github.com/didip/tollbooth/v6"
 	"github.com/didip/tollbooth/v6/limiter"
@@ -22,6 +23,76 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
 )
+
+func verifyToken(ctx context.Context, token string) (*idtoken.Payload, error) {
+	payload, err := idtoken.Validate(ctx, token, "")
+	if err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func AuthMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+        authHeader := r.Header.Get("Authorization")
+        if authHeader == "" {
+            log.Println("Auth Middleware - Authorization header missing")
+            http.Error(w, "Authorization header missing", http.StatusUnauthorized)
+            return
+        }
+
+        bearerToken := authHeader[len("Bearer "):]
+
+        ctx := context.Background()
+        payload, err := verifyToken(ctx, bearerToken)
+        if err != nil {
+            log.Println("Auth Middleware - Invalid token:", err)
+            http.Error(w, "Invalid token: "+err.Error(), http.StatusUnauthorized)
+            return
+        }
+		
+        // Try to get the email or fall back to sub for service accounts
+        email, ok := payload.Claims["email"].(string)
+        if !ok {
+            sub, ok := payload.Claims["sub"].(string)
+            if !ok {
+                log.Println("Auth Middleware - No email or sub claim found")
+                http.Error(w, "Unauthorized: email or sub claim not found", http.StatusUnauthorized)
+                return
+            }
+
+            // Here you can check if the sub is one of your known service accounts
+            if sub == "115948611325767960336" || sub == "102082983954728444659"  {
+                log.Println("Auth Middleware - Authorized service account sub:", sub)
+                next.ServeHTTP(w, r)
+                return
+            }
+
+            log.Println("Auth Middleware - Unauthorized service account sub:", sub)
+            http.Error(w, "Unauthorized: service account sub not allowed", http.StatusUnauthorized)
+            return
+        }
+
+        // Whitelist specific service accounts or domains
+        if email == "pipelines-sa@int-bio-foldingstudio-gcp.iam.gserviceaccount.com" {
+            log.Println("Auth Middleware - Authorized service account:", email)
+            next.ServeHTTP(w, r)
+            return
+        }
+
+        // Check if the email domain is instadeep.com
+        if !strings.HasSuffix(email, "@instadeep.com") {
+            log.Println("Auth Middleware - Unauthorized email:", email)
+            http.Error(w, "Unauthorized: email domain is not allowed", http.StatusUnauthorized)
+            return
+        }
+
+        log.Println("Auth Middleware - Authorized email:", email)
+        next.ServeHTTP(w, r)
+    })
+}
+
 
 type DatabaseResponse struct {
 	Databases []Params `json:"databases"`
@@ -1041,6 +1112,8 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		h = c.Handler(h)
 		h = CorsCache(h, 86400)
 	}
+	
+	h = AuthMiddleware(h)
 
 	srv := &http.Server{
 		Handler: h,
